@@ -6,9 +6,7 @@ def test_agent(agent, env, nb_max_episode_steps=200):
     """documentation"""
 
     results = {'rewards': [],
-               'obs': [],
-               'r_Ia': [],
-               'r_mn': []}
+               'obs': []}
     # Obtain the initial observation by resetting the environment.
     agent.reset_states()
     observation = deepcopy(env.reset())
@@ -26,7 +24,7 @@ def test_agent(agent, env, nb_max_episode_steps=200):
 
         observation, r, d, info = env.step(action)
 
-        _r_Ia, _r_mn = env.get_aux_info()
+        #_r_Ia, _r_mn = env.get_aux_info()
         #print(_r_Ia, _r_mn)
 
         d_state = env.get_d_state(action)
@@ -55,8 +53,8 @@ def test_agent(agent, env, nb_max_episode_steps=200):
 
         results['rewards'].append(reward)
         results['obs'].append(observation)
-        results['r_mn'].append(_r_mn)
-        results['r_Ia'].append(_r_Ia)
+        #results['r_mn'].append(_r_mn)
+        #results['r_Ia'].append(_r_Ia)
         #results['r_shoulder'].append()
 
 

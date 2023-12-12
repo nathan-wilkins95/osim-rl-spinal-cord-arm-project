@@ -10,6 +10,7 @@ from keras.optimizers import Adam
 import os
 import numpy as np
 import datetime as dt
+import pickle
 
 from rl.agents import DDPGAgent
 from rl.memory import SequentialMemory
@@ -114,21 +115,58 @@ else:
     # Initialize empty dictionary
     d_combined_states = {key: [] for key in list_d_states[0].keys()}
     # Iterate over all d_states variables
+    idx_best_run = 0
+    reward_best = -1e99
     for k, (results, d_states) in enumerate(zip(list_results, list_d_states)):
         print(f'[{k + 1}/{len(list_results)}]')
         # Add a list for each key to the combined list (and ultimately do this for all d_states in list_d_states, because of the outer loop)
         for key, item in d_states.items():
             # item here equals d_states[key]
             d_combined_states[key] = d_combined_states[key] + item
+
+        reward_mean = np.mean(results['rewards'])
+        if reward_mean > reward_best:
+            idx_best_run = k
+            reward_best = reward_mean
+
     # Compute statistics for each variable
     for key, item in d_combined_states.items():
         print(f'{key} = {np.mean(item):.4f}±{np.std(item, ddof=1):.4f}')
 
+    # Select best
+    d_state_best = list_d_states[idx_best_run]
+    results_best = list_results[idx_best_run]
+
     # Define y-labels for substrings
     y_label_dict = {"pos": "deg", "velocity": "m/s", "vel": "deg/s", "acc": "deg/s^2", "length": "m", "activation": "N"}
 
+    rew = results_best['rewards']
+    obs = results_best['obs']
+    r_mn = results_best['r_mn']
+    r_Ia = results_best['r_Ia']
+
+    if print_best:
+        idx_best = np.argmax(rew)
+        print(f"Best episode: {idx_best+1} (index {idx_best})")
+        for key, item in d_state_best.items():
+            unit = "y"
+            for key_label, item_label in y_label_dict.items():
+                if key_label in key:
+                    unit = item_label
+                    break
+            print(f"{key}: {item[idx_best]:.4f}±{np.std(item, ddof=1):.4f} {unit}")
+
+    file_pickle = '/home/reluctanthero/Code/osim-rl(1)/examples/figures/SC_figures/d_combined_states.pkl'
+    with open(file_pickle, 'wb') as fp:
+        pickle.dump(d_state_best, fp)
+
+    file_pickle = '/home/reluctanthero/Code/osim-rl(1)/examples/figures/SC_figures/list_results.pkl'
+    with open(file_pickle, 'wb') as fp:
+        pickle.dump(results_best, fp)
+
+
     if convert_rad_to_deg:
-        for key, item in d_states.items():
+        for key, item in d_state_best.items():
             item_label = ""
             for key_label, item_label in y_label_dict.items():
                 if key_label in key:
@@ -139,11 +177,9 @@ else:
             if "deg" in item_label:
                 print(f"Convert {key} from radians to degrees")
                 item_deg = np.rad2deg(item)
-                d_states[key] = item_deg
+                d_state_best[key] = item_deg
 
 
-    rew = results['rewards']
-    obs = results['obs']
 
     save_plots = True
     path_fig_base = '/home/reluctanthero/Code/osim-rl(1)/examples/figures/SC_figures'
@@ -190,7 +226,7 @@ else:
     else:
         plt.show()
 
-    for key, item in d_states.items():
+    for key, item in d_state_best.items():
         fig, ax = plt.subplots()
         ax.plot(item)
         ax.grid()
@@ -211,13 +247,3 @@ else:
         else:
             plt.show()
 
-    if print_best:
-        idx_best = np.argmax(rew)
-        print(f"Best episode: {idx_best+1} (index {idx_best})")
-        for key, item in d_combined_states.items():
-            unit = "y"
-            for key_label, item_label in y_label_dict.items():
-                if key_label in key:
-                    unit = item_label
-                    break
-            print(f"{key}: {item[idx_best]:.4f}±{np.std(item, ddof=1):.4f} {unit}")
