@@ -9,22 +9,35 @@ from .osim import OsimEnv
 
 # ---------------------------------------------------------------------------
 # Physiological joint angle limits (radians)
-# Shoulder: roughly -30° to 120° of flexion in the 2-D sagittal plane
-# Elbow:    0° (full extension) to ~135° of flexion
+# Shoulder: -30deg to 120deg of flexion in the 2-D sagittal plane
+# Elbow:      0deg (full extension) to ~135deg of flexion
 # ---------------------------------------------------------------------------
-SHOULDER_MIN, SHOULDER_MAX = -0.5236, 2.0944   # -30° to 120°
-ELBOW_MIN,    ELBOW_MAX    =  0.0,    2.3562   #   0° to 135°
+SHOULDER_MIN, SHOULDER_MAX = -0.5236, 2.0944
+ELBOW_MIN,    ELBOW_MAX    =  0.0,    2.3562
 
-# Reward shaping weights — tune as needed
-W_EFFORT     = 0.01    # penalty per unit of total squared muscle activation
-W_SMOOTHNESS = 0.001   # penalty per unit of total squared joint velocity
-W_JOINT_LIM  = 0.5     # penalty per unit of joint limit violation (squared)
+# ---------------------------------------------------------------------------
+# Reward shaping weights
+# Conservative starting values — halved from initial to prevent effort penalty
+# from overwhelming the distance signal in early training (agent collapsing
+# to zero activation).  Tune upward once agent reliably reaches targets.
+#
+# Sanity check: at max co-contraction (all 6 activations = 1.0)
+#   effort term  = W_EFFORT * 6 = 0.03  << 1.0 base reward  ✓
+# ---------------------------------------------------------------------------
+W_EFFORT     = 0.005   # penalty per unit squared muscle activation (sum over 6)
+W_SMOOTHNESS = 0.0005  # penalty per unit squared joint angular velocity
+W_JOINT_LIM  = 0.5     # soft-barrier penalty for exceeding anatomical ROM
+
+# Muscle groupings for Co-Contraction Index (CCI) computation
+FLEXOR_MUSCLES   = ['BIClong', 'BICshort', 'BRA']
+EXTENSOR_MUSCLES = ['TRIlong', 'TRIlat',   'TRImed']
 
 
 def _range_violation(val: float, low: float, high: float, margin: float = 0.1) -> float:
     """
-    Returns a squared soft-barrier penalty when `val` is within `margin`
-    of (or outside) the joint limit.  Zero when comfortably inside range.
+    Soft-barrier joint limit penalty.
+    Returns squared deviation when val is within margin of (or outside) the limit.
+    Zero when comfortably inside the physiological range.
     """
     if val < low + margin:
         return (val - low - margin) ** 2
@@ -60,31 +73,35 @@ class Arm2DEnv(OsimEnv):
             d[f'{joint}_acc'] = state_desc["joint_acc"][joint]
 
         for muscle in sorted(state_desc["muscles"].keys()):
-            d[f'{muscle}_activation']    = state_desc["muscles"][muscle]["activation"]
-            d[f'{muscle}_fiber_length']  = state_desc["muscles"][muscle]["fiber_length"]
-            d[f'{muscle}_fiber_velocity']= state_desc["muscles"][muscle]["fiber_velocity"]
+            d[f'{muscle}_activation']     = state_desc["muscles"][muscle]["activation"]
+            d[f'{muscle}_fiber_length']   = state_desc["muscles"][muscle]["fiber_length"]
+            d[f'{muscle}_fiber_velocity'] = state_desc["muscles"][muscle]["fiber_velocity"]
 
         d["markers_0"] = state_desc["markers"]["r_radius_styloid"]["pos"][0]
         d["markers_1"] = state_desc["markers"]["r_radius_styloid"]["pos"][1]
 
+        # Co-contraction index: min(mean_flexor_act, mean_extensor_act)
+        # 0 = no co-contraction, 0.5 = full simultaneous activation
+        flexor_act   = np.mean([state_desc["muscles"][m]["activation"] for m in FLEXOR_MUSCLES])
+        extensor_act = np.mean([state_desc["muscles"][m]["activation"] for m in EXTENSOR_MUSCLES])
+        d["CCI"] = float(min(flexor_act, extensor_act))
+
+        # Recruitment diversity: std of mean activation across all 6 muscles
+        # Low = one or two muscles dominate; high = coordinated selective recruitment
+        all_acts = [state_desc["muscles"][m]["activation"] for m in sorted(state_desc["muscles"].keys())]
+        d["recruitment_diversity"] = float(np.std(all_acts))
+
         return d
 
     # ------------------------------------------------------------------
-    # Observation vector fed to the RL agent
-    # Includes fiber length + velocity so the agent can sense
-    # muscle state and learn coordinated, physiologically realistic
-    # recruitment rather than brute-force co-contraction.
-    #
-    # Observation layout (28 values total):
-    #   [0-1]   target x, y
-    #   [2-7]   r_shoulder pos/vel/acc  (each a 1-element list)
-    #   [8-13]  r_elbow    pos/vel/acc
-    #   [14-31] 6 muscles × 3 (activation, fiber_length, fiber_velocity)
-    #   [32-33] wrist marker x, y
+    # Observation vector (34 values):
+    #   [0-1]    target x, y
+    #   [2-13]   r_shoulder + r_elbow: pos/vel/acc
+    #   [14-31]  6 muscles x3: activation, fiber_length, fiber_velocity
+    #   [32-33]  wrist marker x, y
     # ------------------------------------------------------------------
     def get_observation(self):
         state_desc = self.get_state_desc()
-
         res = [self.target_x, self.target_y]
 
         for joint in ["r_shoulder", "r_elbow"]:
@@ -98,29 +115,21 @@ class Arm2DEnv(OsimEnv):
             res += [state_desc["muscles"][muscle]["fiber_velocity"]]
 
         res += state_desc["markers"]["r_radius_styloid"]["pos"][:2]
-
         return res
 
     def get_observation_space_size(self):
-        # 2 target + 2 joints×3 features + 6 muscles×3 features + 2 marker = 34
+        # 2 target + 2 joints*3 + 6 muscles*3 + 2 marker = 34
         return 34
 
-    # ------------------------------------------------------------------
-    # Target generation
-    # FIX: removed hardcoded overrides that forced every episode to the
-    # same fixed point, preventing the agent from learning to generalise.
-    # Set env var FIXED_TARGET=1 to restore the old single-target mode
-    # for quick debugging.
-    # ------------------------------------------------------------------
     def generate_new_target(self):
         if os.getenv("FIXED_TARGET"):
             self.target_x = 0.16056636337579086
             self.target_y = 0.49340151308159397
         else:
-            theta          = random.uniform(0, math.pi * 2 / 3)
-            radius         = random.uniform(0.3, 0.65)
-            self.target_x  = math.cos(theta) * radius
-            self.target_y  = -math.sin(theta) * radius + 0.8
+            theta         = random.uniform(0, math.pi * 2 / 3)
+            radius        = random.uniform(0.3, 0.65)
+            self.target_x = math.cos(theta) * radius
+            self.target_y = -math.sin(theta) * radius + 0.8
 
         print('\ntarget: [{:.4f} {:.4f}]'.format(self.target_x, self.target_y))
 
@@ -150,50 +159,31 @@ class Arm2DEnv(OsimEnv):
             opensim.Vec3(0, 0, -0.25),
             opensim.Vec3(0, 0, 0)
         )
-
         self.noutput = self.osim_model.noutput
-
         geometry = opensim.Ellipsoid(0.02, 0.02, 0.02)
         geometry.setColor(opensim.Green)
         blockos.attachGeometry(geometry)
-
         self.osim_model.model.addJoint(self.target_joint)
         self.osim_model.model.addBody(blockos)
         self.osim_model.model.initSystem()
 
     # ------------------------------------------------------------------
-    # Shaped reward
-    #
-    # Components:
-    #   1. Distance penalty    — primary task signal (reach the target)
-    #   2. Effort penalty      — discourages full co-contraction of all
-    #                            muscles simultaneously; encourages the
-    #                            agent to use only the muscles it needs
-    #   3. Smoothness penalty  — discourages high joint velocities /
-    #                            jerky motion; promotes physiological
-    #                            movement trajectories
-    #   4. Joint limit penalty — soft barrier at anatomical ROM limits;
-    #                            prevents unrealistic joint angles
+    # Shaped reward — returns (scalar, info_dict) for component logging
     # ------------------------------------------------------------------
     def reward(self):
         state_desc = self.get_state_desc()
 
-        # 1. Distance to target (primary)
         dx = state_desc["markers"]["r_radius_styloid"]["pos"][0] - self.target_x
         dy = state_desc["markers"]["r_radius_styloid"]["pos"][1] - self.target_y
         dist_penalty = dx ** 2 + dy ** 2
 
-        # 2. Metabolic effort — penalise squared activations across all 6 muscles
-        activations   = [state_desc["muscles"][m]["activation"]
-                         for m in state_desc["muscles"]]
+        activations    = [state_desc["muscles"][m]["activation"] for m in state_desc["muscles"]]
         effort_penalty = np.sum(np.square(activations))
 
-        # 3. Smoothness — penalise high joint angular velocities
-        joint_vels        = (state_desc["joint_vel"]["r_shoulder"] +
-                             state_desc["joint_vel"]["r_elbow"])
+        joint_vels         = (state_desc["joint_vel"]["r_shoulder"] +
+                              state_desc["joint_vel"]["r_elbow"])
         smoothness_penalty = np.sum(np.square(joint_vels))
 
-        # 4. Joint range-of-motion soft barrier
         shoulder_pos  = state_desc["joint_pos"]["r_shoulder"][0]
         elbow_pos     = state_desc["joint_pos"]["r_elbow"][0]
         joint_penalty = (_range_violation(shoulder_pos, SHOULDER_MIN, SHOULDER_MAX) +
@@ -201,14 +191,23 @@ class Arm2DEnv(OsimEnv):
 
         total = (1.0
                  - dist_penalty
-                 - W_EFFORT      * effort_penalty
-                 - W_SMOOTHNESS  * smoothness_penalty
-                 - W_JOINT_LIM   * joint_penalty)
+                 - W_EFFORT     * effort_penalty
+                 - W_SMOOTHNESS * smoothness_penalty
+                 - W_JOINT_LIM  * joint_penalty)
 
-        return float(np.nan_to_num(total))
+        # Return component breakdown alongside scalar for logging
+        info = {
+            'reward_dist':    float(dist_penalty),
+            'reward_effort':  float(W_EFFORT     * effort_penalty),
+            'reward_smooth':  float(W_SMOOTHNESS * smoothness_penalty),
+            'reward_joint':   float(W_JOINT_LIM  * joint_penalty),
+            'reward_total':   float(np.nan_to_num(total)),
+        }
+        return float(np.nan_to_num(total)), info
 
     def get_reward(self):
-        return self.reward()
+        total, _ = self.reward()
+        return total
 
 
 class Arm2DVecEnv(Arm2DEnv):
@@ -225,5 +224,5 @@ class Arm2DVecEnv(Arm2DEnv):
         if np.isnan(obs).any():
             obs    = np.nan_to_num(obs)
             done   = True
-            reward -= 10   # FIX: was `reward - 10` (no-op); now correctly subtracts penalty
+            reward -= 10
         return obs, reward, done, info

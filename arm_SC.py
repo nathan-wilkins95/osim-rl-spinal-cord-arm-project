@@ -9,29 +9,28 @@ from .osim import OsimEnv
 
 # ---------------------------------------------------------------------------
 # Physiological joint angle limits (radians)
-# Shoulder: -30deg to 120deg of flexion in the 2-D sagittal plane
-# Elbow:      0deg (full extension) to ~135deg of flexion
 # ---------------------------------------------------------------------------
 SHOULDER_MIN, SHOULDER_MAX = -0.5236, 2.0944
 ELBOW_MIN,    ELBOW_MAX    =  0.0,    2.3562
 
-# Reward shaping weights
-W_EFFORT     = 0.01
-W_SMOOTHNESS = 0.001
+# ---------------------------------------------------------------------------
+# Reward shaping weights (conservative starting values)
+# ---------------------------------------------------------------------------
+W_EFFORT     = 0.005
+W_SMOOTHNESS = 0.0005
 W_JOINT_LIM  = 0.5
 
 # Prochazka Ia afferent model parameters
-IA_A = 4.3   # velocity-sensitive gain
-IA_B = 2.0   # length-sensitive gain
-IA_C = 10.0  # baseline firing rate
+IA_A = 4.3
+IA_B = 2.0
+IA_C = 10.0
+
+# Muscle groupings for CCI
+FLEXOR_MUSCLES   = ['BIClong', 'BICshort', 'BRA']
+EXTENSOR_MUSCLES = ['TRIlong', 'TRIlat',   'TRImed']
 
 
 def _range_violation(val: float, low: float, high: float, margin: float = 0.1) -> float:
-    """
-    Soft-barrier joint limit penalty.
-    Returns squared deviation when val is within margin of (or outside) the limit.
-    Zero when comfortably inside the physiological range.
-    """
     if val < low + margin:
         return (val - low - margin) ** 2
     if val > high - margin:
@@ -46,18 +45,10 @@ class Arm2DEnv(OsimEnv):
     target_y = 0
 
     def get_aux_info(self):
-        """
-        Returns (r_Ia, r_mn) arrays for logging/analysis.
-        FIX: returns zero arrays before the first step instead of (None, None),
-        which previously caused crashes in any logging code expecting arrays.
-        """
         r_Ia = self._r_Ia if self._r_Ia is not None else np.zeros(6)
         r_mn = self._r_mn if self._r_mn is not None else np.zeros(6)
         return r_Ia, r_mn
 
-    # ------------------------------------------------------------------
-    # State dictionary (used for logging / analysis)
-    # ------------------------------------------------------------------
     def get_d_state(self, action):
         state_desc = self.get_state_desc()
         d = {}
@@ -82,19 +73,18 @@ class Arm2DEnv(OsimEnv):
 
         d["markers_0"] = state_desc["markers"]["r_radius_styloid"]["pos"][0]
         d["markers_1"] = state_desc["markers"]["r_radius_styloid"]["pos"][1]
+
+        # Co-contraction index
+        flexor_act   = np.mean([state_desc["muscles"][m]["activation"] for m in FLEXOR_MUSCLES])
+        extensor_act = np.mean([state_desc["muscles"][m]["activation"] for m in EXTENSOR_MUSCLES])
+        d["CCI"] = float(min(flexor_act, extensor_act))
+
+        # Recruitment diversity
+        all_acts = [state_desc["muscles"][m]["activation"] for m in sorted(state_desc["muscles"].keys())]
+        d["recruitment_diversity"] = float(np.std(all_acts))
+
         return d
 
-    # ------------------------------------------------------------------
-    # Observation vector (34 values)
-    #   [0-1]    target x, y
-    #   [2-13]   r_shoulder + r_elbow: pos/vel/acc
-    #   [14-31]  6 muscles x3: activation, fiber_length, fiber_velocity
-    #   [32-33]  wrist marker x, y
-    #
-    # FIX: fiber_length and fiber_velocity restored (were commented out).
-    # The SC model needs these to compute meaningful Ia afferent signals;
-    # without them the agent cannot sense muscle state for coordination.
-    # ------------------------------------------------------------------
     def get_observation(self):
         state_desc = self.get_state_desc()
         res = [self.target_x, self.target_y]
@@ -113,15 +103,8 @@ class Arm2DEnv(OsimEnv):
         return res
 
     def get_observation_space_size(self):
-        # 2 target + 2 joints*3 features + 6 muscles*3 features + 2 marker = 34
         return 34
 
-    # ------------------------------------------------------------------
-    # Target generation
-    # FIX: removed hardcoded overrides that pinned every episode to one
-    # fixed target coordinate, preventing generalisation.
-    # Set env var FIXED_TARGET=1 to restore single-target debug mode.
-    # ------------------------------------------------------------------
     def generate_new_target(self):
         if os.getenv("FIXED_TARGET"):
             self.target_x = 0.16056636337579086
@@ -149,8 +132,6 @@ class Arm2DEnv(OsimEnv):
         return obs
 
     def __init__(self, *args, **kwargs):
-        # FIX: initialise to zero arrays (not None) so get_aux_info() is
-        # safe to call before the first step without crashing.
         self._r_Ia = np.zeros(6)
         self._r_mn = np.zeros(6)
         super(Arm2DEnv, self).__init__(*args, **kwargs)
@@ -166,33 +147,25 @@ class Arm2DEnv(OsimEnv):
             opensim.Vec3(0, 0, 0)
         )
 
-        # Spinal cord reciprocal inhibition weight matrix.
-        # Diagonal = self-excitation (1.0).
-        # Off-diagonal -0.5 entries = Ia inhibitory interneuron projections
-        # from each muscle's afferent onto its functional antagonists.
-        # Layout: [BIClong, BICshort, BRA, TRIlong, TRIlat, TRImed]
+        # Reciprocal inhibition weight matrix
+        # Rows/cols: [BIClong, BICshort, BRA, TRIlong, TRIlat, TRImed]
         self.W_SC = np.array([
-            [ 1.0,  0.0,  0.0, -0.5,  0.0,  0.0],   # BIClong  inhibits TRIlong
-            [ 0.0,  1.0,  0.0,  0.0, -0.5, -0.5],   # BICshort inhibits TRIlat, TRImed
-            [ 0.0,  0.0,  1.0,  0.0, -0.5, -0.5],   # BRA      inhibits TRIlat, TRImed
-            [-0.5,  0.0,  0.0,  1.0,  0.0,  0.0],   # TRIlong  inhibits BIClong
-            [ 0.0, -0.5, -0.5,  0.0,  1.0,  0.0],   # TRIlat   inhibits BICshort, BRA
-            [ 0.0, -0.5, -0.5,  0.0,  0.0,  1.0],   # TRImed   inhibits BICshort, BRA
+            [ 1.0,  0.0,  0.0, -0.5,  0.0,  0.0],
+            [ 0.0,  1.0,  0.0,  0.0, -0.5, -0.5],
+            [ 0.0,  0.0,  1.0,  0.0, -0.5, -0.5],
+            [-0.5,  0.0,  0.0,  1.0,  0.0,  0.0],
+            [ 0.0, -0.5, -0.5,  0.0,  1.0,  0.0],
+            [ 0.0, -0.5, -0.5,  0.0,  0.0,  1.0],
         ], dtype=float)
 
         self.noutput = self.osim_model.noutput
-
         geometry = opensim.Ellipsoid(0.02, 0.02, 0.02)
         geometry.setColor(opensim.Green)
         blockos.attachGeometry(geometry)
-
         self.osim_model.model.addJoint(self.target_joint)
         self.osim_model.model.addBody(blockos)
         self.osim_model.model.initSystem()
 
-    # ------------------------------------------------------------------
-    # Shaped reward (identical structure to arm.py)
-    # ------------------------------------------------------------------
     def reward(self):
         state_desc = self.get_state_desc()
 
@@ -218,26 +191,24 @@ class Arm2DEnv(OsimEnv):
                  - W_SMOOTHNESS * smoothness_penalty
                  - W_JOINT_LIM  * joint_penalty)
 
-        return float(np.nan_to_num(total))
+        info = {
+            'reward_dist':   float(dist_penalty),
+            'reward_effort': float(W_EFFORT     * effort_penalty),
+            'reward_smooth': float(W_SMOOTHNESS * smoothness_penalty),
+            'reward_joint':  float(W_JOINT_LIM  * joint_penalty),
+            'reward_total':  float(np.nan_to_num(total)),
+        }
+        return float(np.nan_to_num(total)), info
 
     def get_reward(self):
-        return self.reward()
+        total, _ = self.reward()
+        return total
 
 
 class Arm2DVecEnv(Arm2DEnv):
 
     def Prochazka_Ia_rates(self, a=IA_A, b=IA_B, c=IA_C):
-        """
-        Compute normalised Ia afferent firing rates using the Prochazka model.
-
-        FIX 1: replaced np.sign(fiber_v) with a safe signed-power formulation.
-                np.sign(0) == 0 which zeroed the velocity term at simulation
-                start (fiber_v is 0 on the first step of every episode).
-        FIX 2: inner np.log() now clamps its argument to >= 1e-6 (was 0.01
-                but only on the velocity term; the denominator's log had no
-                guard and could silently produce -inf / NaN for tiny max_v).
-        FIX 3: outer max(..., 0) clamping preserved to keep rates non-negative.
-        """
+        """Compute normalised Ia afferent firing rates (Prochazka model)."""
         state_desc = self.get_state_desc()
         norm_rate  = np.zeros(6)
 
@@ -247,27 +218,23 @@ class Arm2DVecEnv(Arm2DEnv):
 
             fiber_l = state_desc["muscles"][name]["fiber_length"]  * 1000
             fiber_v = state_desc["muscles"][name]["fiber_velocity"] * 1000
-            opt_l   = muscle.getOptimalFiberLength()    * 1000
+            opt_l   = muscle.getOptimalFiberLength()     * 1000
             max_v   = muscle.getMaxContractionVelocity() * opt_l
 
-            # Safe signed power: preserves direction without collapsing to 0
-            # when fiber_v == 0 (as np.sign would).
-            abs_v_clamped    = max(min(abs(fiber_v), max_v), 1e-6)
-            max_v_clamped    = max(max_v, 1e-6)
-            signed_vel_term  = (np.sign(fiber_v) if fiber_v != 0 else 1.0) * \
-                               np.exp(0.6 * np.log(abs_v_clamped))
+            abs_v_clamped   = max(min(abs(fiber_v), max_v), 1e-6)
+            max_v_clamped   = max(max_v, 1e-6)
+            signed_vel_term = (np.sign(fiber_v) if fiber_v != 0 else 1.0) * \
+                              np.exp(0.6 * np.log(abs_v_clamped))
 
-            rate = (a * signed_vel_term
-                    + b * (min(fiber_l, 1.5 * opt_l) - opt_l)
-                    + c)
-
+            rate  = (a * signed_vel_term
+                     + b * (min(fiber_l, 1.5 * opt_l) - opt_l)
+                     + c)
             denom = a * np.exp(0.6 * np.log(max_v_clamped)) + b * 0.5 * opt_l + c
             norm_rate[i] = max(rate / denom, 0.0)
 
         return norm_rate
 
     def sigmoid(self, x, alpha=8, beta=0.5):
-        """Sigmoid activation function."""
         return 1.0 / (1.0 + np.exp(-alpha * (x - beta)))
 
     def reset(self, obs_as_dict=False):
@@ -280,27 +247,17 @@ class Arm2DVecEnv(Arm2DEnv):
         if np.isnan(action).any():
             action = np.nan_to_num(action)
 
-        # --- Spinal cord model -------------------------------------------
-        # 1. Compute Ia afferent rates from current muscle state
         r_Ia       = self.Prochazka_Ia_rates()
         self._r_Ia = r_Ia
-
-        # 2. Sigmoid-compress Ia rates -> inhibitory interneuron signals
-        r_Ia_s = self.sigmoid(r_Ia)
-
-        # 3. Combine SC interneuron output with RL policy action
-        #    FIX: clamp r_mn to [0, 1] before passing to OpenSim.
-        #    Previously sigmoid(...) + action was unbounded; values outside
-        #    [0, 1] are invalid muscle activations and cause sim instability.
+        r_Ia_s     = self.sigmoid(r_Ia)
         r_mn       = np.clip(self.sigmoid(np.matmul(self.W_SC, r_Ia_s)) + action, 0.0, 1.0)
         self._r_mn = r_mn
-        # ----------------------------------------------------------------
 
         obs, reward, done, info = super(Arm2DVecEnv, self).step(r_mn, obs_as_dict=obs_as_dict)
 
         if np.isnan(obs).any():
             obs     = np.nan_to_num(obs)
             done    = True
-            reward -= 10   # FIX: was `reward - 10` (no-op expression)
+            reward -= 10
 
         return obs, reward, done, info

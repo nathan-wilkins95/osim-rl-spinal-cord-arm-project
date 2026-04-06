@@ -19,10 +19,9 @@ from examples.test_MS_agents import test_agent, test_agents
 import matplotlib.pyplot as plt
 
 # ---------------------------------------------------------------------------
-# NOTE: observation space was updated from 16 -> 34 (fiber_length +
-# fiber_velocity restored, joint limits added).  Previously saved .h5f
-# weights trained on obs=16 are incompatible and must be retrained.
-# To retrain from scratch:  python train_arm.py --train --steps 20000
+# NOTE: observation space = 34 (fiber_length/velocity restored).
+# Old .h5f weights trained on obs=16 are incompatible -- retrain from scratch.
+# To train:  python train_arm.py --train --steps 100000
 # ---------------------------------------------------------------------------
 
 number_of_steps      = 200
@@ -30,20 +29,14 @@ number_of_iterations = 5
 print_best           = False
 convert_rad_to_deg   = True
 
-# ---------------------------------------------------------------------------
-# Paths  --  relative to this file so the script runs on any machine
-# ---------------------------------------------------------------------------
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 PATH_FIG_BASE = os.path.join(BASE_DIR, 'figures', 'MS_figures')
 PATH_PICKLE   = os.path.join(PATH_FIG_BASE, 'd_combined_states.pkl')
 
-# Command line parameters
-# FIX: removed `args.train = False` override that silently disabled --train.
-# FIX: removed `args.steps = 20000` override that silently ignored --steps.
 parser = argparse.ArgumentParser(description='Train or test neural net motor controller')
 parser.add_argument('--train',     dest='train',     action='store_true',  default=False)
 parser.add_argument('--test',      dest='train',     action='store_false')
-parser.add_argument('--steps',     dest='steps',     action='store',       default=20000, type=int)
+parser.add_argument('--steps',     dest='steps',     action='store',       default=100000, type=int)
 parser.add_argument('--visualize', dest='visualize', action='store_true')
 parser.add_argument('--model',     dest='model',     action='store',       default=os.path.join(BASE_DIR, 'train_arm20.h5f'))
 args = parser.parse_args()
@@ -55,15 +48,17 @@ nb_actions = env.action_space.shape[0]
 nallsteps  = args.steps
 
 # ---------------------------------------------------------------------------
-# DDPG actor / critic networks
+# DDPG networks
+# Scaled up from 3x32/3x64 to 3x64/3x128 to match the larger obs space (34)
+# and give the critic capacity to evaluate the multi-component shaped reward.
 # ---------------------------------------------------------------------------
 actor = Sequential()
 actor.add(Flatten(input_shape=(1,) + env.observation_space.shape))
-actor.add(Dense(32))
+actor.add(Dense(64))
 actor.add(Activation('relu'))
-actor.add(Dense(32))
+actor.add(Dense(64))
 actor.add(Activation('relu'))
-actor.add(Dense(32))
+actor.add(Dense(64))
 actor.add(Activation('relu'))
 actor.add(Dense(nb_actions))
 actor.add(Activation('sigmoid'))
@@ -73,50 +68,52 @@ action_input      = Input(shape=(nb_actions,), name='action_input')
 observation_input = Input(shape=(1,) + env.observation_space.shape, name='observation_input')
 flattened_obs     = Flatten()(observation_input)
 x = concatenate([action_input, flattened_obs])
-x = Dense(64)(x)
+x = Dense(128)(x)
 x = Activation('relu')(x)
-x = Dense(64)(x)
+x = Dense(128)(x)
 x = Activation('relu')(x)
-x = Dense(64)(x)
+x = Dense(128)(x)
 x = Activation('relu')(x)
 x = Dense(1)(x)
 x = Activation('linear')(x)
 critic = Model(inputs=[action_input, observation_input], outputs=x)
 print(critic.summary())
 
-memory         = SequentialMemory(limit=200000, window_length=1)
+# ---------------------------------------------------------------------------
+# Agent setup
+# Warmup increased 100 -> 1000: richer obs space needs more random exploration
+# before gradient updates begin.
+# Replay buffer increased 200k -> 500k: shaped reward has higher variance
+# early in training; larger buffer stabilises critic updates.
+# ---------------------------------------------------------------------------
+memory         = SequentialMemory(limit=500000, window_length=1)
 random_process = OrnsteinUhlenbeckProcess(theta=.15, mu=0., sigma=.2, size=env.noutput)
 agent = DDPGAgent(
     nb_actions=nb_actions, actor=actor, critic=critic,
     critic_action_input=action_input,
     memory=memory,
-    nb_steps_warmup_critic=100, nb_steps_warmup_actor=100,
+    nb_steps_warmup_critic=1000,
+    nb_steps_warmup_actor=1000,
     random_process=random_process,
     gamma=.99, target_model_update=1e-3, delta_clip=1.
 )
 agent.compile(Adam(lr=.001, clipnorm=1.), metrics=['mae'])
 
-# ---------------------------------------------------------------------------
-# Train or test
-# ---------------------------------------------------------------------------
 if args.train:
     agent.fit(env, nb_steps=nallsteps, visualize=False, verbose=1,
-              nb_max_episode_steps=200, log_interval=nallsteps)
+              nb_max_episode_steps=200, log_interval=10000)
     agent.save_weights(args.model, overwrite=True)
 
 else:
-    # Guard: warn clearly if saved weights are incompatible with current obs space
     try:
         agent.load_weights(args.model)
     except Exception as e:
         print(f"[WARNING] Could not load weights from {args.model}: {e}")
-        print("  The observation space changed from 16 -> 34 (fiber_length/velocity restored).")
-        print("  Retrain with:  python train_arm.py --train --steps 20000")
+        print("  Observation space changed from 16 -> 34. Retrain with --train --steps 100000")
         sys.exit(1)
 
     list_results, list_d_states = test_agents(agent, env, number_of_steps, number_of_iterations)
 
-    # Accumulate across all test runs
     d_combined_states = {key: [] for key in list_d_states[0].keys()}
     idx_best_run      = 0
     reward_best       = -1e99
@@ -133,6 +130,15 @@ else:
     for key, item in d_combined_states.items():
         print(f'{key} = {np.mean(item):.4f}+/-{np.std(item, ddof=1):.4f}')
 
+    # Print validation summary
+    cci_vals  = d_combined_states.get('CCI', [])
+    rdiv_vals = d_combined_states.get('recruitment_diversity', [])
+    if cci_vals:
+        print(f'\n--- Validation Metrics ---')
+        print(f'Mean CCI:                  {np.mean(cci_vals):.4f}  (target < 0.1)')
+        print(f'Mean recruitment_diversity:{np.mean(rdiv_vals):.4f}  (target > 0.1)')
+        print(f'Max  CCI:                  {np.max(cci_vals):.4f}')
+
     d_states_best  = list_d_states[idx_best_run]
     results_best   = list_results[idx_best_run]
 
@@ -140,19 +146,12 @@ else:
     with open(PATH_PICKLE, 'wb') as fp:
         pickle.dump(d_combined_states, fp)
 
-    # FIX: y-label for activation corrected from 'N' (Newtons) to '[-]'
-    # (muscle activation is dimensionless 0-1, not a force value)
     y_label_dict = {
-        "pos":      "deg",
-        "velocity": "m/s",
-        "vel":      "deg/s",
-        "acc":      "deg/s^2",
-        "length":   "m",
-        "activation": "[-]",
+        "pos": "deg", "velocity": "m/s", "vel": "deg/s",
+        "acc": "deg/s^2", "length": "m", "activation": "[-]",
+        "CCI": "[-]", "diversity": "[-]",
     }
 
-    # FIX: convert_rad_to_deg now operates on d_combined_states (all runs)
-    # instead of d_states (only the last loop iteration).
     if convert_rad_to_deg:
         for key, item in d_combined_states.items():
             item_label = ""
@@ -161,7 +160,6 @@ else:
                     item_label = val_label
                     break
             if "deg" in item_label:
-                print(f"Convert {key} from radians to degrees")
                 d_combined_states[key] = list(np.rad2deg(item))
 
     folder_date = dt.datetime.strftime(dt.datetime.now(), "%Y%m%dT%H%M")
@@ -171,7 +169,6 @@ else:
     rew = results_best['rewards']
     obs = results_best['obs']
 
-    # Reward over time
     nn = len(rew)
     t  = np.linspace(1, nn, nn)
     plt.figure()
@@ -183,7 +180,6 @@ else:
     plt.savefig(os.path.join(path_fig, 'MS_model_rew.png'))
     plt.close()
 
-    # Wrist trajectory vs target
     obs     = np.array(obs)
     targets = obs[:, 0:2]
     act_pos = obs[:, -2:]
@@ -200,7 +196,20 @@ else:
     plt.savefig(os.path.join(path_fig, 'MS_model_obs.png'))
     plt.close()
 
-    # Per-variable time series
+    # CCI over time
+    if cci_vals:
+        plt.figure()
+        plt.plot(cci_vals)
+        plt.axhline(0.1, color='r', linestyle='--', label='target < 0.1')
+        plt.grid()
+        plt.ylim((0, 0.6))
+        plt.xlabel('time [-]')
+        plt.ylabel('CCI [-]')
+        plt.title('Co-Contraction Index')
+        plt.legend()
+        plt.savefig(os.path.join(path_fig, 'MS_model_CCI.png'))
+        plt.close()
+
     for key, item in d_combined_states.items():
         fig, ax = plt.subplots()
         ax.plot(item)
@@ -215,15 +224,3 @@ else:
         ax.set_ylabel(y_label_text)
         plt.savefig(os.path.join(path_fig, f'MS_model_{key}.png'))
         plt.close()
-
-    if print_best:
-        idx_best = np.argmax(rew)
-        print(f'Best episode: {idx_best + 1} (index {idx_best})')
-        for key, item in d_states_best.items():
-            unit = 'y'
-            for key_label, val_label in y_label_dict.items():
-                if key_label in key:
-                    unit = val_label
-                    break
-            val = item[idx_best] if hasattr(item, '__len__') else item
-            print(f'{key}: {val:.4f}+/-{np.std(item, ddof=1):.4f} {unit}')
