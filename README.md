@@ -1,8 +1,57 @@
 # osim-rl Spinal Cord Arm Project
 
-A reinforcement learning environment for 2-DOF arm reaching using [OpenSim](https://opensim.stanford.edu/) and [osim-rl](https://github.com/stanfordnmbl/osim-rl), extended with a biologically-inspired spinal cord interneuron model.
+> **A biologically grounded OpenSim-RL upper-extremity model that compares movement learning with and without spinal cord feedback to study reach control, co-contraction, and rehab-relevant recovery dynamics.**
 
-The project trains a DDPG agent to control a 6-muscle, 2-joint (shoulder + elbow) arm model to reach randomised targets, with an optional Ia afferent / motor neuron spinal cord layer modulating muscle activations.
+A reinforcement learning environment for 2-DOF arm reaching using [OpenSim](https://opensim.stanford.edu/) and [osim-rl](https://github.com/stanfordnmbl/osim-rl), extended with a biologically-inspired spinal cord interneuron model. This project originated as master's-level research and is being developed toward a PhD-level research direction in computational neuroscience and motor rehabilitation.
+
+---
+
+## Research Overview
+
+This project investigates how spinal cord feedback changes the way a reinforcement learning agent learns to control an upper-extremity musculoskeletal model. By comparing a **baseline musculoskeletal (MS) model** against a **spinal cord-augmented (SC) model**, the experiment targets key questions in motor neuroscience:
+
+- Does spinal cord feedback improve muscle coordination and reduce co-contraction during reaching?
+- Does Ia afferent-driven reciprocal inhibition produce more biologically realistic joint kinematics?
+- Can spinal-level control improve robustness and recovery-relevant movement patterns?
+
+These questions connect to translational goals in **spinal cord injury rehabilitation**, **motor learning research**, and **prosthetics control**.
+
+---
+
+## Research Flow
+
+```mermaid
+flowchart TD
+    A[OpenSim Upper-Body Model
+2 DOF · 6 Muscles] --> B{Control Condition}
+    B --> C[With Spinal Cord Feedback
+arm_SC.py]
+    B --> D[Without Spinal Cord Feedback
+arm.py]
+
+    C --> E[Prochazka Ia Afferent Model]
+    E --> F[Reciprocal Inhibition via W_SC]
+    F --> G[Motor Neuron Output → OpenSim]
+
+    D --> H[Direct RL Policy → OpenSim]
+
+    G --> I[DDPG Agent Learns Reach / Grasp Control]
+    H --> I
+
+    I --> J[Measure Co-Contraction]
+    I --> K[Measure Movement Smoothness]
+    I --> L[Measure Joint ROM Compliance]
+    I --> M[Measure Recovery-Relevant Metrics]
+
+    J --> N[Compare SC vs MS Outcomes]
+    K --> N
+    L --> N
+    M --> N
+
+    N --> O[Novelty: Spinal Feedback Effect
+on RL Motor Learning]
+    O --> P[Applications: Rehab · SCI · Motor Control Research]
+```
 
 ---
 
@@ -10,23 +59,26 @@ The project trains a DDPG agent to control a 6-muscle, 2-joint (shoulder + elbow
 
 ```
 osim-rl-spinal-cord-arm-project/
-├── arm.py                   # Base RL environment (Arm2DEnv, Arm2DVecEnv)
-├── arm_SC.py                # SC-extended environment (adds Prochazka Ia model + W_SC)
-├── train_arm.py             # Train / test script for base MS model
-├── train_arm_SC.py          # Train / test script for SC model
-├── test_MS_agents.py        # Test harness for base model
-├── test_SC_agents.py        # Test harness for SC model
+├── arm.py                        # Base RL environment (Arm2DEnv, Arm2DVecEnv)
+├── arm_SC.py                     # SC-extended environment (Prochazka Ia + W_SC)
+├── train_arm.py                  # Train / test script for base MS model
+├── train_arm_SC.py               # Train / test script for SC model
+├── test_MS_agents.py             # Test harness for base model
+├── test_SC_agents.py             # Test harness for SC model
 ├── pickle_MS_flexor_plots.py     # Plot BIC/BRA muscle data from saved pickle
 ├── pickle_MS_extensor_plots.py   # Plot TRI muscle data from saved pickle
 ├── pickle_SC_flexor_plots.py     # SC version of flexor plots
 ├── pickle_SC_extensor_plots.py   # SC version of extensor plots
 ├── pickle_SC_results.py          # Plot r_Ia and r_mn from SC results pickle
-├── requirements_tf.txt      # Python dependencies
+├── requirements_tf.txt           # Python dependencies
+├── 20231207T2336/                # Archived training run (Dec 2023)
+├── MS_Model_20/                  # Saved MS model weights (20k steps)
+├── SC_Model_21/                  # Saved SC model weights (21k steps)
 ├── figures/
-│   ├── MS_figures/          # Output plots for base model (auto-created)
-│   └── SC_figures/          # Output plots for SC model (auto-created)
+│   ├── MS_figures/               # Output plots for base model (auto-created)
+│   └── SC_figures/               # Output plots for SC model (auto-created)
 └── models/
-    └── arm2dof6musc.osim    # OpenSim musculoskeletal model (2 DOF, 6 muscles)
+    └── arm2dof6musc.osim         # OpenSim musculoskeletal model (2 DOF, 6 muscles)
 ```
 
 ---
@@ -35,26 +87,26 @@ osim-rl-spinal-cord-arm-project/
 
 The model includes 6 muscles across shoulder and elbow joints:
 
-| Label     | Full Name                  | Action       |
-|-----------|----------------------------|--------------|
-| BIClong   | Biceps brachii (long head) | Elbow flexor |
-| BICshort  | Biceps brachii (short head)| Elbow flexor |
-| BRA       | Brachialis                 | Elbow flexor |
-| TRIlong   | Triceps brachii (long)     | Elbow extensor |
-| TRIlat    | Triceps brachii (lateral)  | Elbow extensor |
-| TRImed    | Triceps brachii (medial)   | Elbow extensor |
+| Label     | Full Name                   | Action          |
+|-----------|-----------------------------|-----------------|
+| BIClong   | Biceps brachii (long head)  | Elbow flexor    |
+| BICshort  | Biceps brachii (short head) | Elbow flexor    |
+| BRA       | Brachialis                  | Elbow flexor    |
+| TRIlong   | Triceps brachii (long)      | Elbow extensor  |
+| TRIlat    | Triceps brachii (lateral)   | Elbow extensor  |
+| TRImed    | Triceps brachii (medial)    | Elbow extensor  |
 
 ---
 
 ## Observation Space (34 values)
 
-| Index   | Description                                  |
-|---------|----------------------------------------------|
-| 0–1     | Target x, y position (m)                    |
-| 2–7     | r_shoulder: pos, vel, acc                   |
-| 8–13    | r_elbow: pos, vel, acc                      |
-| 14–31   | 6 muscles × 3: activation, fiber_length, fiber_velocity |
-| 32–33   | Wrist marker (r_radius_styloid) x, y (m)   |
+| Index | Description                                                        |
+|-------|--------------------------------------------------------------------|
+| 0–1   | Target x, y position (m)                                          |
+| 2–7   | Shoulder: pos, vel, acc (3 values)                                |
+| 8–13  | Elbow: pos, vel, acc (3 values)                                   |
+| 14–31 | 6 muscles × 3: activation, fiber_length, fiber_velocity           |
+| 32–33 | Wrist marker (r_radius_styloid) x, y (m)                         |
 
 ---
 
@@ -82,14 +134,26 @@ Weights are top-of-file constants in `arm.py` / `arm_SC.py` and easy to tune.
 
 The SC layer sits between the RL policy output and OpenSim muscle activations:
 
-1. **Prochazka Ia afferent rates** — computed from current fiber length and velocity using the Prochazka (1999) model
+1. **Prochazka Ia afferent rates** — computed from fiber length and velocity using the Prochazka (1999) model
 2. **Sigmoid compression** — Ia rates passed through sigmoid to produce interneuron signals
 3. **Reciprocal inhibition** — `W_SC` (6×6) matrix encodes Ia inhibitory interneuron projections from each muscle onto its antagonists
 4. **Motor neuron output** — `r_mn = clip(sigmoid(W_SC @ r_Ia_s) + action, 0, 1)` — clamped to valid activation range before passing to OpenSim
 
 ---
 
-## Training
+## Quick Start
+
+### Installation
+
+```bash
+# Recommended: use a conda environment with osim-rl
+conda create -n osim-rl python=3.6
+conda activate osim-rl
+pip install osim-rl
+pip install -r requirements_tf.txt
+```
+
+### Training
 
 ```bash
 # Train base MS model (20 000 steps)
@@ -134,6 +198,18 @@ Output PNGs are saved to `figures/{MS,SC}_figures/custom_muscle_subplots/`.
 
 ---
 
+## Novelty vs. Existing Work
+
+| Dimension | Existing Work | This Project |
+|-----------|--------------|--------------|
+| Upper-limb OpenSim + RL | One published RL reaching study (simplified dynamics) | Full 6-muscle, 2-DOF model with biologically realistic fiber dynamics |
+| Spinal cord feedback | Not included in RL reaching literature | Prochazka Ia model + reciprocal inhibition integrated into RL loop |
+| Comparative design | Single model, no control condition | Explicit MS vs. SC comparison with matched training |
+| Rehab metrics | Reward = task completion only | Co-contraction, smoothness, ROM compliance, recovery-relevant outcomes |
+| Biological plausibility | Simplified activation | Muscle fiber length + velocity in obs space; spinal modulation of activations |
+
+---
+
 ## Known Issues Fixed (April 2026 Refactor)
 
 | File | Issue | Fix |
@@ -167,3 +243,13 @@ See `requirements_tf.txt`. Key packages:
 - `keras` / `tensorflow`
 - `keras-rl`
 - `numpy`, `matplotlib`
+
+---
+
+## Author
+
+**Nathan Wilkins**
+Computational Neuroscience / Motor Control Research
+McComb, MS · [GitHub](https://github.com/nathan-wilkins95)
+
+*This project is being developed as a foundation for PhD-level research in computational neuroscience, spinal motor control, and rehabilitation engineering.*
