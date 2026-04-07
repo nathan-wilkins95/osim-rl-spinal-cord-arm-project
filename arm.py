@@ -1,3 +1,53 @@
+"""arm.py — Baseline Musculoskeletal (MS) Arm Environment
+
+Defines the OpenSim-based 2-DOF, 6-muscle arm reaching environment used as the
+control condition in the spinal cord feedback study. A DDPG agent controls muscle
+activations directly — no spinal cord layer is present.
+
+Classes
+-------
+Arm2DEnv
+    Core gym-compatible environment wrapping the OpenSim arm model. Handles
+    observation construction, shaped reward computation, target generation, and
+    state logging. Inherits from OsimEnv (osim-rl).
+
+Arm2DVecEnv
+    Vectorised wrapper around Arm2DEnv. Adds NaN safety guards on observations
+    and actions for use with keras-rl's DDPG agent.
+
+Model
+-----
+    arm2dof6musc.osim  —  2 degrees of freedom (shoulder flexion, elbow flexion)
+                          6 Hill-type muscles: BIClong, BICshort, BRA (flexors)
+                                               TRIlong, TRIlat, TRImed (extensors)
+
+Usage
+-----
+    # Training (see train_arm.py)
+    from osim.env.arm import Arm2DVecEnv
+    env = Arm2DVecEnv(visualize=False)
+    obs = env.reset()
+    obs, reward, done, info = env.step(action)
+
+Notes
+-----
+    Observation space: 34 values
+        [0-1]   target x, y (m)
+        [2-13]  r_shoulder + r_elbow: pos, vel, acc (3 values each)
+        [14-31] 6 muscles × 3: activation [-], fiber_length [m], fiber_velocity [m/s]
+        [32-33] wrist marker (r_radius_styloid) x, y (m)
+
+    Reward is shaped across four components:
+        r = 1.0 - dist_penalty - effort_penalty - smoothness_penalty - joint_limit_penalty
+
+References
+----------
+    Delp et al. (2007). OpenSim: Open-source software to create and analyze
+        dynamic simulations of movement. IEEE Trans. Biomed. Eng.
+    Crowninshield & Brand (1981). A physiologically based criterion of muscle
+        force prediction in locomotion. J. Biomechanics.
+"""
+
 import math
 import numpy as np
 import os
@@ -34,10 +84,30 @@ EXTENSOR_MUSCLES = ['TRIlong', 'TRIlat',   'TRImed']
 
 
 def _range_violation(val: float, low: float, high: float, margin: float = 0.1) -> float:
-    """
-    Soft-barrier joint limit penalty.
-    Returns squared deviation when val is within margin of (or outside) the limit.
-    Zero when comfortably inside the physiological range.
+    """Compute a soft-barrier joint limit penalty.
+
+    Returns a squared deviation when *val* encroaches within *margin* of a
+    physiological limit, and zero when comfortably inside the range.  This
+    discourages hyperextension / hyperlexion without creating a hard wall
+    that would destabilise the RL gradient.
+
+    Parameters
+    ----------
+    val : float
+        Current joint angle (radians).
+    low : float
+        Minimum physiological joint angle (radians).
+    high : float
+        Maximum physiological joint angle (radians).
+    margin : float, optional
+        Safety buffer inside each limit at which the penalty activates
+        (default 0.1 rad ≈ 5.7°).
+
+    Returns
+    -------
+    float
+        Squared angular deviation from the nearest limit boundary, or 0.0
+        if the joint is within the safe operating range.
     """
     if val < low + margin:
         return (val - low - margin) ** 2
@@ -47,15 +117,59 @@ def _range_violation(val: float, low: float, high: float, margin: float = 0.1) -
 
 
 class Arm2DEnv(OsimEnv):
+    """2-DOF, 6-muscle OpenSim arm reaching environment (baseline MS condition).
+
+    Wraps the OpenSim musculoskeletal model ``arm2dof6musc.osim`` as a
+    gym-compatible environment.  The RL policy outputs muscle activations
+    directly — there is no spinal cord processing layer (see ``arm_SC.py``
+    for the SC-augmented condition).
+
+    Attributes
+    ----------
+    model_path : str
+        Absolute path to the .osim musculoskeletal model file.
+    time_limit : int
+        Maximum number of simulation steps per episode (default 200).
+    target_x : float
+        Current reach target x-coordinate (metres).
+    target_y : float
+        Current reach target y-coordinate (metres).
+    target_joint : opensim.PlanarJoint
+        Planar joint used to position the visual reach target sphere in the
+        OpenSim scene.
+    noutput : int
+        Number of muscle actuators (= 6).
+    """
+
     model_path = os.path.join(os.path.dirname(__file__), '../models/arm2dof6musc.osim')
     time_limit = 200
     target_x = 0
     target_y = 0
 
-    # ------------------------------------------------------------------
-    # State dictionary (used for logging / analysis)
-    # ------------------------------------------------------------------
     def get_d_state(self, action):
+        """Build a flat state dictionary for logging and analysis.
+
+        Collects per-step kinematic, muscle, and co-contraction data into a
+        single dict suitable for writing to a pickle file and later plotting
+        with the ``pickle_*.py`` scripts.
+
+        Parameters
+        ----------
+        action : array-like
+            The muscle activation vector applied at this step (unused in
+            computation but included for API consistency with subclasses).
+
+        Returns
+        -------
+        dict
+            Keys include:
+            - ``r_ulna_radius_hand_pos/vel/acc_{0,1}`` : hand segment kinematics
+            - ``r_shoulder/r_elbow_pos/vel/acc``        : joint kinematics
+            - ``{muscle}_activation/fiber_length/fiber_velocity`` : 6 muscles
+            - ``markers_0/1``          : wrist marker x, y (m)
+            - ``CCI``                  : Co-Contraction Index (0–0.5)
+            - ``recruitment_diversity``: std of muscle activations across 6 muscles
+        """
         state_desc = self.get_state_desc()
         d = {}
 
@@ -93,14 +207,19 @@ class Arm2DEnv(OsimEnv):
 
         return d
 
-    # ------------------------------------------------------------------
-    # Observation vector (34 values):
-    #   [0-1]    target x, y
-    #   [2-13]   r_shoulder + r_elbow: pos/vel/acc
-    #   [14-31]  6 muscles x3: activation, fiber_length, fiber_velocity
-    #   [32-33]  wrist marker x, y
-    # ------------------------------------------------------------------
     def get_observation(self):
+        """Construct the 34-element observation vector for the RL policy.
+
+        Returns
+        -------
+        list of float
+            Ordered observation values:
+            [0-1]   target x, y (m)
+            [2-7]   r_shoulder: pos, vel, acc
+            [8-13]  r_elbow:    pos, vel, acc
+            [14-31] 6 muscles (alphabetical) × [activation, fiber_length, fiber_velocity]
+            [32-33] wrist marker (r_radius_styloid) x, y (m)
+        """
         state_desc = self.get_state_desc()
         res = [self.target_x, self.target_y]
 
@@ -118,10 +237,29 @@ class Arm2DEnv(OsimEnv):
         return res
 
     def get_observation_space_size(self):
+        """Return the number of elements in the observation vector.
+
+        Returns
+        -------
+        int
+            34 (2 target + 2 joints × 3 kinematics + 6 muscles × 3 + 2 marker).
+        """
         # 2 target + 2 joints*3 + 6 muscles*3 + 2 marker = 34
         return 34
 
     def generate_new_target(self):
+        """Sample or set a new reach target and update the OpenSim scene.
+
+        In normal training, draws a random target position within a reachable
+        arc (theta in [0, 2π/3], radius in [0.3, 0.65] m) in the sagittal
+        plane.  When the environment variable ``FIXED_TARGET=1`` is set, uses
+        a hard-coded position for reproducible debugging.
+
+        Side Effects
+        ------------
+        Updates ``self.target_x``, ``self.target_y``, and the position of
+        ``self.target_joint`` in the running OpenSim simulation state.
+        """
         if os.getenv("FIXED_TARGET"):
             self.target_x = 0.16056636337579086
             self.target_y = 0.49340151308159397
@@ -141,6 +279,21 @@ class Arm2DEnv(OsimEnv):
         self.osim_model.set_state(state)
 
     def reset(self, random_target=True, obs_as_dict=True):
+        """Reset the environment to its initial state.
+
+        Parameters
+        ----------
+        random_target : bool, optional
+            If True (default), generates a new random reach target.
+            Set to False to keep the previous target position.
+        obs_as_dict : bool, optional
+            Passed through to the parent OsimEnv reset (default True).
+
+        Returns
+        -------
+        array-like
+            Initial observation vector.
+        """
         obs = super(Arm2DEnv, self).reset(obs_as_dict=obs_as_dict)
         if random_target:
             self.generate_new_target()
@@ -148,6 +301,13 @@ class Arm2DEnv(OsimEnv):
         return obs
 
     def __init__(self, *args, **kwargs):
+        """Initialise the arm environment and add the reach target to the model.
+
+        Calls the parent OsimEnv constructor, then attaches a massless target
+        body (rendered as a green ellipsoid) to the model via a PlanarJoint.
+        The target's x/y coordinates are updated each episode by
+        ``generate_new_target``.
+        """
         super(Arm2DEnv, self).__init__(*args, **kwargs)
         blockos = opensim.Body('target', 0.0001, opensim.Vec3(0), opensim.Inertia(1, 1, .0001, 0, 0, 0))
         self.target_joint = opensim.PlanarJoint(
@@ -167,10 +327,35 @@ class Arm2DEnv(OsimEnv):
         self.osim_model.model.addBody(blockos)
         self.osim_model.model.initSystem()
 
-    # ------------------------------------------------------------------
-    # Shaped reward — returns (scalar, info_dict) for component logging
-    # ------------------------------------------------------------------
     def reward(self):
+        """Compute the shaped per-step reward and its component breakdown.
+
+        The reward balances four competing objectives:
+
+        1. **Distance** — minimise squared Euclidean wrist-to-target distance.
+        2. **Effort**   — penalise total squared muscle activation (anti-
+                          co-contraction; metabolic cost proxy).
+        3. **Smoothness** — penalise squared joint angular velocities (anti-jerk).
+        4. **Joint limits** — soft-barrier penalty for approaching anatomical ROM
+                              bounds (see ``_range_violation``).
+
+        Formula::
+
+            r = 1.0
+                - dist_penalty
+                - W_EFFORT     * sum(activation_i^2)
+                - W_SMOOTHNESS * sum(joint_vel_j^2)
+                - W_JOINT_LIM  * joint_barrier_penalty
+
+        Returns
+        -------
+        total : float
+            Scalar reward for this step (NaN-safe).
+        info : dict
+            Per-component breakdown with keys:
+            ``reward_dist``, ``reward_effort``, ``reward_smooth``,
+            ``reward_joint``, ``reward_total``.
+        """
         state_desc = self.get_state_desc()
 
         dx = state_desc["markers"]["r_radius_styloid"]["pos"][0] - self.target_x
@@ -206,18 +391,72 @@ class Arm2DEnv(OsimEnv):
         return float(np.nan_to_num(total)), info
 
     def get_reward(self):
+        """Return only the scalar reward (keras-rl compatible interface).
+
+        Returns
+        -------
+        float
+            Total shaped reward for this step.
+        """
         total, _ = self.reward()
         return total
 
 
 class Arm2DVecEnv(Arm2DEnv):
+    """Vectorised, NaN-safe wrapper around Arm2DEnv for use with keras-rl DDPG.
+
+    Adds input/output safety guards that sanitise NaN values in observations
+    and actions — necessary when OpenSim occasionally produces non-finite
+    states during highly perturbed or degenerate simulation steps.
+
+    Inherits all environment logic from ``Arm2DEnv``.  This class is the one
+    passed directly to the DDPG agent in ``train_arm.py``.
+    """
+
     def reset(self, obs_as_dict=False):
+        """Reset the environment and sanitise the initial observation.
+
+        Parameters
+        ----------
+        obs_as_dict : bool, optional
+            If False (default), returns a flat numpy array.
+
+        Returns
+        -------
+        numpy.ndarray
+            Initial observation with any NaN values replaced by 0.
+        """
         obs = super(Arm2DVecEnv, self).reset(obs_as_dict=obs_as_dict)
         if np.isnan(obs).any():
             obs = np.nan_to_num(obs)
         return obs
 
     def step(self, action, obs_as_dict=False):
+        """Step the environment with NaN guards on both action and observation.
+
+        If the incoming action contains NaN values they are zeroed before being
+        passed to OpenSim.  If the resulting observation is non-finite the
+        episode is terminated immediately and a penalty of -10 is applied to
+        the reward to discourage the policy from entering degenerate states.
+
+        Parameters
+        ----------
+        action : array-like, shape (6,)
+            Desired muscle activation vector in [0, 1].
+        obs_as_dict : bool, optional
+            If False (default), returns observations as a flat numpy array.
+
+        Returns
+        -------
+        obs : numpy.ndarray
+            Next observation (NaN-safe).
+        reward : float
+            Shaped reward (with -10 penalty on NaN termination).
+        done : bool
+            True if the episode has ended.
+        info : dict
+            Reward component breakdown from ``Arm2DEnv.reward``.
+        """
         if np.isnan(action).any():
             action = np.nan_to_num(action)
         obs, reward, done, info = super(Arm2DVecEnv, self).step(action, obs_as_dict=obs_as_dict)
