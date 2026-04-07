@@ -1,125 +1,132 @@
-# Derived from keras-rl
-import opensim as osim
+"""train_arm.py -- Baseline MS arm training/testing script (SB3 DDPG).
+
+Usage
+-----
+    # Train from scratch (200k steps recommended)
+    python train_arm.py --train --steps 200000
+
+    # Test a saved model
+    python train_arm.py --test --model models/train_arm_MS.zip
+
+    # Train with live visualisation (slow)
+    python train_arm.py --train --steps 200000 --visualize
+
+Requires
+--------
+    opensim >= 4.4, stable-baselines3 >= 2.3, gymnasium >= 0.29
+"""
+
 import numpy as np
-import sys
 import os
+import sys
 import datetime as dt
 import pickle
 import argparse
-import math
-
-from keras.models import Sequential, Model
-from keras.layers import Dense, Activation, Flatten, Input, concatenate
-from keras.optimizers import Adam
-from rl.agents import DDPGAgent
-from rl.memory import SequentialMemory
-from rl.random import OrnsteinUhlenbeckProcess
-from osim.env.arm import Arm2DVecEnv
-from examples.test_MS_agents import test_agent, test_agents
 import matplotlib.pyplot as plt
 
-# ---------------------------------------------------------------------------
-# NOTE: observation space = 34 (fiber_length/velocity restored).
-# Old .h5f weights trained on obs=16 are incompatible -- retrain from scratch.
-# To train:  python train_arm.py --train --steps 100000
-# ---------------------------------------------------------------------------
+from stable_baselines3 import DDPG
+from stable_baselines3.common.noise import OrnsteinUhlenbeckActionNoise
+from stable_baselines3.common.callbacks import CheckpointCallback
+from osim.env.arm import Arm2DVecEnv
+from test_MS_agents import test_agents
 
-number_of_steps      = 200
-number_of_iterations = 5
-print_best           = False
-convert_rad_to_deg   = True
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+NUMBER_OF_STEPS      = 200
+NUMBER_OF_ITERATIONS = 5
+CONVERT_RAD_TO_DEG   = True
 
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 PATH_FIG_BASE = os.path.join(BASE_DIR, 'figures', 'MS_figures')
 PATH_PICKLE   = os.path.join(PATH_FIG_BASE, 'd_combined_states.pkl')
+DEFAULT_MODEL = os.path.join(BASE_DIR, 'models', 'train_arm_MS.zip')
 
-parser = argparse.ArgumentParser(description='Train or test neural net motor controller')
+parser = argparse.ArgumentParser(description='Train or test MS arm motor controller')
 parser.add_argument('--train',     dest='train',     action='store_true',  default=False)
 parser.add_argument('--test',      dest='train',     action='store_false')
-parser.add_argument('--steps',     dest='steps',     action='store',       default=100000, type=int)
+parser.add_argument('--steps',     dest='steps',     action='store',       default=200000, type=int)
 parser.add_argument('--visualize', dest='visualize', action='store_true')
-parser.add_argument('--model',     dest='model',     action='store',       default=os.path.join(BASE_DIR, 'train_arm20.h5f'))
+parser.add_argument('--model',     dest='model',     action='store',       default=DEFAULT_MODEL)
 args = parser.parse_args()
 
+os.makedirs(os.path.join(BASE_DIR, 'models'), exist_ok=True)
+os.makedirs(PATH_FIG_BASE, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
 env = Arm2DVecEnv(visualize=args.visualize)
 env.reset()
 
 nb_actions = env.action_space.shape[0]
-nallsteps  = args.steps
 
 # ---------------------------------------------------------------------------
-# DDPG networks
-# Scaled up from 3x32/3x64 to 3x64/3x128 to match the larger obs space (34)
-# and give the critic capacity to evaluate the multi-component shaped reward.
+# DDPG agent (SB3)
+# Actor:  3 x 256 (larger than before -- SB3 scales well)
+# Critic: 3 x 256
+# OU noise: theta=0.15, sigma=0.2 (same as keras-rl baseline)
 # ---------------------------------------------------------------------------
-actor = Sequential()
-actor.add(Flatten(input_shape=(1,) + env.observation_space.shape))
-actor.add(Dense(64))
-actor.add(Activation('relu'))
-actor.add(Dense(64))
-actor.add(Activation('relu'))
-actor.add(Dense(64))
-actor.add(Activation('relu'))
-actor.add(Dense(nb_actions))
-actor.add(Activation('sigmoid'))
-print(actor.summary())
-
-action_input      = Input(shape=(nb_actions,), name='action_input')
-observation_input = Input(shape=(1,) + env.observation_space.shape, name='observation_input')
-flattened_obs     = Flatten()(observation_input)
-x = concatenate([action_input, flattened_obs])
-x = Dense(128)(x)
-x = Activation('relu')(x)
-x = Dense(128)(x)
-x = Activation('relu')(x)
-x = Dense(128)(x)
-x = Activation('relu')(x)
-x = Dense(1)(x)
-x = Activation('linear')(x)
-critic = Model(inputs=[action_input, observation_input], outputs=x)
-print(critic.summary())
-
-# ---------------------------------------------------------------------------
-# Agent setup
-# Warmup increased 100 -> 1000: richer obs space needs more random exploration
-# before gradient updates begin.
-# Replay buffer increased 200k -> 500k: shaped reward has higher variance
-# early in training; larger buffer stabilises critic updates.
-# ---------------------------------------------------------------------------
-memory         = SequentialMemory(limit=500000, window_length=1)
-random_process = OrnsteinUhlenbeckProcess(theta=.15, mu=0., sigma=.2, size=env.noutput)
-agent = DDPGAgent(
-    nb_actions=nb_actions, actor=actor, critic=critic,
-    critic_action_input=action_input,
-    memory=memory,
-    nb_steps_warmup_critic=1000,
-    nb_steps_warmup_actor=1000,
-    random_process=random_process,
-    gamma=.99, target_model_update=1e-3, delta_clip=1.
+action_noise = OrnsteinUhlenbeckActionNoise(
+    mean=np.zeros(nb_actions),
+    sigma=0.2 * np.ones(nb_actions),
+    theta=0.15
 )
-agent.compile(Adam(lr=.001, clipnorm=1.), metrics=['mae'])
 
+policy_kwargs = dict(net_arch=[256, 256, 256])
+
+agent = DDPG(
+    policy='MlpPolicy',
+    env=env,
+    learning_rate=1e-3,
+    buffer_size=500000,
+    learning_starts=1000,
+    batch_size=256,
+    gamma=0.99,
+    tau=1e-3,
+    action_noise=action_noise,
+    policy_kwargs=policy_kwargs,
+    verbose=1,
+    tensorboard_log=os.path.join(BASE_DIR, 'logs', 'MS'),
+)
+
+print(f'Observation space: {env.observation_space.shape}')  # should be (34,)
+print(f'Action space:      {env.action_space.shape}')       # should be (6,)
+
+# ---------------------------------------------------------------------------
+# Train or Test
+# ---------------------------------------------------------------------------
 if args.train:
-    agent.fit(env, nb_steps=nallsteps, visualize=False, verbose=1,
-              nb_max_episode_steps=200, log_interval=10000)
-    agent.save_weights(args.model, overwrite=True)
+    checkpoint_cb = CheckpointCallback(
+        save_freq=50000,
+        save_path=os.path.join(BASE_DIR, 'models', 'checkpoints_MS'),
+        name_prefix='train_arm_MS'
+    )
+    agent.learn(
+        total_timesteps=args.steps,
+        callback=checkpoint_cb,
+        log_interval=100
+    )
+    agent.save(args.model)
+    print(f'Model saved to {args.model}')
 
 else:
-    try:
-        agent.load_weights(args.model)
-    except Exception as e:
-        print(f"[WARNING] Could not load weights from {args.model}: {e}")
-        print("  Observation space changed from 16 -> 34. Retrain with --train --steps 100000")
+    if not os.path.exists(args.model) and not os.path.exists(args.model + '.zip'):
+        print(f'[ERROR] Model not found: {args.model}')
+        print('  Train first with: python train_arm.py --train --steps 200000')
         sys.exit(1)
 
-    list_results, list_d_states = test_agents(agent, env, number_of_steps, number_of_iterations)
+    agent = DDPG.load(args.model, env=env)
+    print(f'Loaded model from {args.model}')
+
+    list_results, list_d_states = test_agents(agent, env, NUMBER_OF_STEPS, NUMBER_OF_ITERATIONS)
 
     d_combined_states = {key: [] for key in list_d_states[0].keys()}
     idx_best_run      = 0
     reward_best       = -1e99
 
     for k, (results, d_states) in enumerate(zip(list_results, list_d_states)):
-        print(f'[{k + 1}/{len(list_results)}]')
+        print(f'Episode [{k + 1}/{len(list_results)}]')
         for key, item in d_states.items():
             d_combined_states[key] = d_combined_states[key] + item
         reward_mean = np.mean(results['rewards'])
@@ -128,41 +135,36 @@ else:
             reward_best  = reward_mean
 
     for key, item in d_combined_states.items():
-        print(f'{key} = {np.mean(item):.4f}+/-{np.std(item, ddof=1):.4f}')
+        print(f'  {key} = {np.mean(item):.4f} +/- {np.std(item, ddof=1):.4f}')
 
-    # Print validation summary
     cci_vals  = d_combined_states.get('CCI', [])
     rdiv_vals = d_combined_states.get('recruitment_diversity', [])
     if cci_vals:
         print(f'\n--- Validation Metrics ---')
-        print(f'Mean CCI:                  {np.mean(cci_vals):.4f}  (target < 0.1)')
-        print(f'Mean recruitment_diversity:{np.mean(rdiv_vals):.4f}  (target > 0.1)')
-        print(f'Max  CCI:                  {np.max(cci_vals):.4f}')
+        print(f'  Mean CCI:                   {np.mean(cci_vals):.4f}  (target < 0.1)')
+        print(f'  Mean recruitment_diversity: {np.mean(rdiv_vals):.4f}  (target > 0.1)')
+        print(f'  Max  CCI:                   {np.max(cci_vals):.4f}')
 
-    d_states_best  = list_d_states[idx_best_run]
-    results_best   = list_results[idx_best_run]
+    d_states_best = list_d_states[idx_best_run]
+    results_best  = list_results[idx_best_run]
 
-    os.makedirs(PATH_FIG_BASE, exist_ok=True)
     with open(PATH_PICKLE, 'wb') as fp:
         pickle.dump(d_combined_states, fp)
 
     y_label_dict = {
-        "pos": "deg", "velocity": "m/s", "vel": "deg/s",
-        "acc": "deg/s^2", "length": "m", "activation": "[-]",
-        "CCI": "[-]", "diversity": "[-]",
+        'pos': 'deg', 'velocity': 'm/s', 'vel': 'deg/s',
+        'acc': 'deg/s^2', 'length': 'm', 'activation': '[-]',
+        'CCI': '[-]', 'diversity': '[-]',
     }
 
-    if convert_rad_to_deg:
+    if CONVERT_RAD_TO_DEG:
         for key, item in d_combined_states.items():
-            item_label = ""
             for key_label, val_label in y_label_dict.items():
-                if key_label in key:
-                    item_label = val_label
+                if key_label in key and 'deg' in val_label:
+                    d_combined_states[key] = list(np.rad2deg(item))
                     break
-            if "deg" in item_label:
-                d_combined_states[key] = list(np.rad2deg(item))
 
-    folder_date = dt.datetime.strftime(dt.datetime.now(), "%Y%m%dT%H%M")
+    folder_date = dt.datetime.strftime(dt.datetime.now(), '%Y%m%dT%H%M')
     path_fig    = os.path.join(PATH_FIG_BASE, folder_date)
     os.makedirs(path_fig, exist_ok=True)
 
@@ -185,10 +187,10 @@ else:
     act_pos = obs[:, -2:]
     c_time  = np.linspace(0, 1, targets.shape[0])
     plt.figure()
+    sc = plt.scatter(act_pos[:, 0], act_pos[:, 1], s=10, c=c_time, cmap='jet', label='wrist')
     plt.scatter(targets[:, 0], targets[:, 1], marker='x', label='target')
-    plt.scatter(act_pos[:, 0], act_pos[:, 1], s=10, c=c_time, cmap='jet', label='wrist')
+    plt.colorbar(sc, label='time')
     plt.grid()
-    plt.colorbar()
     plt.ylim((-1, 1))
     plt.xlabel('x [m]')
     plt.ylabel('y [m]')
@@ -196,7 +198,6 @@ else:
     plt.savefig(os.path.join(path_fig, 'MS_model_obs.png'))
     plt.close()
 
-    # CCI over time
     if cci_vals:
         plt.figure()
         plt.plot(cci_vals)
@@ -205,7 +206,7 @@ else:
         plt.ylim((0, 0.6))
         plt.xlabel('time [-]')
         plt.ylabel('CCI [-]')
-        plt.title('Co-Contraction Index')
+        plt.title('Co-Contraction Index (MS)')
         plt.legend()
         plt.savefig(os.path.join(path_fig, 'MS_model_CCI.png'))
         plt.close()
@@ -224,3 +225,5 @@ else:
         ax.set_ylabel(y_label_text)
         plt.savefig(os.path.join(path_fig, f'MS_model_{key}.png'))
         plt.close()
+
+    print(f'Plots saved to {path_fig}')
