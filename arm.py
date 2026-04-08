@@ -23,7 +23,6 @@ Model
 
 Usage
 -----
-    # Training (see train_arm.py)
     from osim.env.arm import Arm2DVecEnv
     env = Arm2DVecEnv(visualize=False)
     obs = env.reset()
@@ -34,18 +33,13 @@ Notes
     Observation space: 28 values
         [0-1]   target x, y (m)
         [2-7]   r_shoulder + r_elbow: pos[1], vel[1], acc[1] each
-        [8-25]  6 muscles × 3: activation [-], fiber_length [m], fiber_velocity [m/s]
-        [26-27] wrist marker (r_radius_styloid) x, y (m)
-
-    Reward is shaped across four components:
-        r = 1.0 - dist_penalty - effort_penalty - smoothness_penalty - joint_limit_penalty
+        [8-25]  6 muscles x 3: activation, fiber_length, fiber_velocity
+        [26-27] wrist marker x, y (m)
 
 References
 ----------
-    Delp et al. (2007). OpenSim: Open-source software to create and analyze
-        dynamic simulations of movement. IEEE Trans. Biomed. Eng.
-    Crowninshield & Brand (1981). A physiologically based criterion of muscle
-        force prediction in locomotion. J. Biomechanics.
+    Delp et al. (2007). OpenSim. IEEE Trans. Biomed. Eng.
+    Crowninshield & Brand (1981). J. Biomechanics.
 """
 
 import math
@@ -69,28 +63,7 @@ EXTENSOR_MUSCLES = ['TRIlong', 'TRIlat',   'TRImed']
 
 
 def _range_violation(val: float, low: float, high: float, margin: float = 0.1) -> float:
-    """Compute a soft-barrier joint limit penalty.
-
-    Returns a squared deviation when *val* encroaches within *margin* of a
-    physiological limit, and zero when comfortably inside the range.
-
-    Parameters
-    ----------
-    val : float
-        Current joint angle (radians).
-    low : float
-        Minimum physiological joint angle (radians).
-    high : float
-        Maximum physiological joint angle (radians).
-    margin : float, optional
-        Safety buffer inside each limit (default 0.1 rad ≈ 5.7°).
-
-    Returns
-    -------
-    float
-        Squared angular deviation from the nearest limit boundary, or 0.0
-        if within the safe operating range.
-    """
+    """Compute a soft-barrier joint limit penalty."""
     if val < low + margin:
         return (val - low - margin) ** 2
     if val > high - margin:
@@ -107,7 +80,11 @@ class Arm2DEnv(OsimEnv):
     target_y = 0
 
     def get_d_state(self, action):
-        """Build a flat state dictionary for logging and analysis."""
+        """Build a flat state dictionary for logging and analysis.
+
+        Joint pos/vel/acc are stored as scalars (index [0]) since
+        state_desc returns 1-element lists for each coordinate.
+        """
         state_desc = self.get_state_desc()
         d = {}
 
@@ -120,9 +97,9 @@ class Arm2DEnv(OsimEnv):
             d[f'{body_part}_acc_1']  = state_desc["body_acc"][body_part][1]
 
         for joint in ["r_shoulder", "r_elbow"]:
-            d[f'{joint}_pos'] = state_desc["joint_pos"][joint]
-            d[f'{joint}_vel'] = state_desc["joint_vel"][joint]
-            d[f'{joint}_acc'] = state_desc["joint_acc"][joint]
+            d[f'{joint}_pos'] = state_desc["joint_pos"][joint][0]
+            d[f'{joint}_vel'] = state_desc["joint_vel"][joint][0]
+            d[f'{joint}_acc'] = state_desc["joint_acc"][joint][0]
 
         for muscle in sorted(state_desc["muscles"].keys()):
             d[f'{muscle}_activation']     = state_desc["muscles"][muscle]["activation"]
@@ -142,16 +119,7 @@ class Arm2DEnv(OsimEnv):
         return d
 
     def get_observation(self):
-        """Construct the 28-element observation vector for the RL policy.
-
-        Returns
-        -------
-        list of float
-            [0-1]   target x, y (m)
-            [2-7]   r_shoulder + r_elbow: pos[1], vel[1], acc[1]
-            [8-25]  6 muscles (alphabetical) x [activation, fiber_length, fiber_velocity]
-            [26-27] wrist marker (r_radius_styloid) x, y (m)
-        """
+        """Construct the 28-element observation vector for the RL policy."""
         state_desc = self.get_state_desc()
         res = [self.target_x, self.target_y]
 
@@ -169,13 +137,7 @@ class Arm2DEnv(OsimEnv):
         return res
 
     def get_observation_space_size(self):
-        """Return the observation vector length.
-
-        Returns
-        -------
-        int
-            28 (2 target + 2 joints x 3 kinematics + 6 muscles x 3 + 2 marker).
-        """
+        """Return the observation vector length (28)."""
         return 28
 
     def generate_new_target(self):

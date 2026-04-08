@@ -8,35 +8,16 @@ cord feedback study.
 Spinal Cord Pipeline (per step)
 --------------------------------
 1. **Prochazka Ia afferent rates** — ``Prochazka_Ia_rates()`` computes
-   normalised Ia afferent firing rates from current fiber length and velocity
-   using the Prochazka (1999) model.
-2. **Sigmoid compression** — raw Ia rates are passed through a sigmoid to
-   produce bounded interneuron signals (r_Ia_s).
-3. **Reciprocal inhibition** — ``W_SC`` (6x6 matrix) encodes Ia inhibitory
-   interneuron projections from each muscle onto its functional antagonists.
-4. **Motor neuron output** — ``r_mn = clip(sigmoid(W_SC @ r_Ia_s) + action, 0, 1)``
-   combines spinal modulation with the policy action before passing to OpenSim.
-
-Classes
--------
-Arm2DEnv
-    SC-augmented version of the base environment. Stores r_Ia and r_mn
-    arrays for per-step logging. Inherits from OsimEnv.
-
-Arm2DVecEnv
-    Vectorised, NaN-safe wrapper. Houses the Prochazka model and step logic
-    that injects the SC layer into the action pipeline.
-
-Model
------
-    arm2dof6musc.osim  --  2 DOF, 6 Hill-type muscles (same as arm.py).
-    W_SC (6x6)         --  Reciprocal inhibition connectivity matrix.
+   normalised Ia afferent firing rates from current fiber length and velocity.
+2. **Sigmoid compression** — raw Ia rates passed through sigmoid -> r_Ia_s.
+3. **Reciprocal inhibition** — W_SC (6x6) encodes antagonist inhibition.
+4. **Motor neuron output** — r_mn = clip(sigmoid(W_SC @ r_Ia_s) + action, 0, 1).
 
 References
 ----------
-    Prochazka, A. (1999). Quantifying proprioception. Prog. Brain Res., 123, 133-142.
-    Eccles, J.C. et al. (1956). Central pathways for Ia inhibitory interneurons.
-    Delp et al. (2007). OpenSim. IEEE Trans. Biomed. Eng.
+    Prochazka (1999). Prog. Brain Res., 123, 133-142.
+    Eccles et al. (1956). J. Physiol.
+    Delp et al. (2007). IEEE Trans. Biomed. Eng.
 """
 
 import math
@@ -87,7 +68,11 @@ class Arm2DEnv(OsimEnv):
         return r_Ia, r_mn
 
     def get_d_state(self, action):
-        """Build a flat state dictionary for logging and analysis."""
+        """Build a flat state dictionary for logging and analysis.
+
+        Joint pos/vel/acc are stored as scalars (index [0]) since
+        state_desc returns 1-element lists for each coordinate.
+        """
         state_desc = self.get_state_desc()
         d = {}
 
@@ -100,9 +85,9 @@ class Arm2DEnv(OsimEnv):
             d[f'{body_part}_acc_1']  = state_desc["body_acc"][body_part][1]
 
         for joint in ["r_shoulder", "r_elbow"]:
-            d[f'{joint}_pos'] = state_desc["joint_pos"][joint]
-            d[f'{joint}_vel'] = state_desc["joint_vel"][joint]
-            d[f'{joint}_acc'] = state_desc["joint_acc"][joint]
+            d[f'{joint}_pos'] = state_desc["joint_pos"][joint][0]
+            d[f'{joint}_vel'] = state_desc["joint_vel"][joint][0]
+            d[f'{joint}_acc'] = state_desc["joint_acc"][joint][0]
 
         for muscle in sorted(state_desc["muscles"].keys()):
             d[f'{muscle}_activation']     = state_desc["muscles"][muscle]["activation"]
@@ -122,16 +107,7 @@ class Arm2DEnv(OsimEnv):
         return d
 
     def get_observation(self):
-        """Construct the 28-element observation vector for the RL policy.
-
-        Returns
-        -------
-        list of float
-            [0-1]   target x, y (m)
-            [2-7]   r_shoulder + r_elbow: pos[1], vel[1], acc[1]
-            [8-25]  6 muscles (alphabetical) x [activation, fiber_length, fiber_velocity]
-            [26-27] wrist marker (r_radius_styloid) x, y (m)
-        """
+        """Construct the 28-element observation vector for the RL policy."""
         state_desc = self.get_state_desc()
         res = [self.target_x, self.target_y]
 
@@ -149,13 +125,7 @@ class Arm2DEnv(OsimEnv):
         return res
 
     def get_observation_space_size(self):
-        """Return the observation vector length.
-
-        Returns
-        -------
-        int
-            28 (2 target + 2 joints x 3 kinematics + 6 muscles x 3 + 2 marker).
-        """
+        """Return the observation vector length (28)."""
         return 28
 
     def generate_new_target(self):
@@ -247,11 +217,11 @@ class Arm2DEnv(OsimEnv):
                  - W_JOINT_LIM  * joint_penalty)
 
         info = {
-            'reward_dist':   float(dist_penalty),
-            'reward_effort': float(W_EFFORT     * effort_penalty),
-            'reward_smooth': float(W_SMOOTHNESS * smoothness_penalty),
-            'reward_joint':  float(W_JOINT_LIM  * joint_penalty),
-            'reward_total':  float(np.nan_to_num(total)),
+            'reward_dist':    float(dist_penalty),
+            'reward_effort':  float(W_EFFORT     * effort_penalty),
+            'reward_smooth':  float(W_SMOOTHNESS * smoothness_penalty),
+            'reward_joint':   float(W_JOINT_LIM  * joint_penalty),
+            'reward_total':   float(np.nan_to_num(total)),
         }
         return float(np.nan_to_num(total)), info
 
